@@ -1,5 +1,5 @@
 // =============================================================================
-// server.js — PLAYKIT Movie Download Server
+// server.js — PLAYKIT Movie Download & Streaming Server
 // Deploy to Railway with package.json in the same repo root
 // =============================================================================
 
@@ -53,12 +53,17 @@ app.use(express.static('public'));
 // CONFIGURATION
 // =============================================================================
 const TMDB_KEY = '480f73d92f9395eb2140f092c746b3bc';
+const YOUTUBE_KEY = 'AIzaSyB3YRLnHIsJyzcktFLBROO-UkfW5wKwD-Q';
 const TEMP_DIR = path.join(os.tmpdir(), 'playkit-downloads');
 
 // Create temp directory if it doesn't exist
 if (!fs.existsSync(TEMP_DIR)) {
     fs.mkdirSync(TEMP_DIR, { recursive: true });
 }
+
+// Cache for streaming sources to avoid repeated YouTube searches
+const streamCache = new Map();
+const CACHE_TTL = 3600000; // 1 hour
 
 // =============================================================================
 // QUALITY PRESETS (H.265 / HEVC)
@@ -138,6 +143,15 @@ function cleanupFiles(...filePaths) {
     });
 }
 
+/**
+ * Extract video ID from YouTube URL
+ */
+function extractVideoId(url) {
+    const regExp = /^.*(youtu.be\/|v\/|u\/\w\/|embed\/|watch\?v=|&v=)([^#&?]*).*/;
+    const match = url.match(regExp);
+    return (match && match[2].length === 11) ? match[2] : null;
+}
+
 // =============================================================================
 // ROUTES
 // =============================================================================
@@ -187,6 +201,235 @@ app.get('/api/movie/:id', async (req, res) => {
 
     } catch (err) {
         console.error('[GET /api/movie/:id]', err.message);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// =============================================================================
+
+/**
+ * GET /api/stream/sources/:id
+ *
+ * Returns streaming sources for a movie (TMDB videos + YouTube search results)
+ * Used by the frontend streaming modal.
+ */
+app.get('/api/stream/sources/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+        
+        // Check cache first
+        if (streamCache.has(id)) {
+            const cached = streamCache.get(id);
+            if (Date.now() - cached.timestamp < CACHE_TTL) {
+                return res.json(cached.data);
+            }
+            streamCache.delete(id);
+        }
+
+        // Get movie details
+        const movieRes = await axios.get(`https://api.themoviedb.org/3/movie/${id}?api_key=${TMDB_KEY}`);
+        const movie = movieRes.data;
+        const year = movie.release_date?.substring(0, 4) || '';
+
+        // Get videos from TMDB
+        const videosRes = await axios.get(`https://api.themoviedb.org/3/movie/${id}/videos?api_key=${TMDB_KEY}`);
+        const tmdbVideos = videosRes.data.results.filter(v => v.site === 'YouTube');
+
+        // Format TMDB videos
+        const tmdbSources = tmdbVideos.map(video => ({
+            id: video.key,
+            title: video.name,
+            type: video.type,
+            source: 'TMDB',
+            embedUrl: `https://www.youtube.com/embed/${video.key}?autoplay=1&rel=0&modestbranding=1`,
+            thumbnail: `https://img.youtube.com/vi/${video.key}/maxresdefault.jpg`,
+            quality: video.type === 'Trailer' ? 'HD' : 'SD'
+        }));
+
+        // Search YouTube for full movie
+        const youtubeResponse = await axios.get(
+            `https://www.googleapis.com/youtube/v3/search?part=snippet&q=${encodeURIComponent(
+                movie.title + ' ' + year + ' full movie'
+            )}&type=video&videoDuration=long&maxResults=5&key=${YOUTUBE_KEY}`
+        );
+
+        const youtubeSources = youtubeResponse.data.items.map(item => ({
+            id: item.id.videoId,
+            title: item.snippet.title,
+            source: 'YouTube Search',
+            embedUrl: `https://www.youtube.com/embed/${item.id.videoId}?autoplay=1&rel=0&modestbranding=1`,
+            thumbnail: item.snippet.thumbnails.high.url,
+            quality: 'HD',
+            type: 'Full Movie (Search)'
+        }));
+
+        // Search for trailer as fallback
+        const trailerResponse = await axios.get(
+            `https://www.googleapis.com/youtube/v3/search?part=snippet&q=${encodeURIComponent(
+                movie.title + ' ' + year + ' trailer'
+            )}&type=video&maxResults=3&key=${YOUTUBE_KEY}`
+        );
+
+        const trailerSources = trailerResponse.data.items.map(item => ({
+            id: item.id.videoId,
+            title: item.snippet.title,
+            source: 'YouTube Trailer',
+            embedUrl: `https://www.youtube.com/embed/${item.id.videoId}?autoplay=1&rel=0&modestbranding=1`,
+            thumbnail: item.snippet.thumbnails.high.url,
+            quality: 'HD',
+            type: 'Trailer'
+        }));
+
+        // Combine all sources with priority sorting
+        const allSources = [
+            ...tmdbSources.filter(v => v.type === 'Movie' || v.type === 'Feature'),
+            ...youtubeSources,
+            ...tmdbSources.filter(v => v.type === 'Trailer'),
+            ...trailerSources,
+            ...tmdbSources
+        ];
+
+        // Remove duplicates by video ID
+        const uniqueSources = [];
+        const seenIds = new Set();
+        for (const source of allSources) {
+            if (!seenIds.has(source.id)) {
+                seenIds.add(source.id);
+                uniqueSources.push(source);
+            }
+        }
+
+        const responseData = {
+            movie: {
+                id: movie.id,
+                title: movie.title,
+                year: year,
+                poster: `https://image.tmdb.org/t/p/w500${movie.poster_path}`,
+                runtime: movie.runtime || 120,
+                vote_average: movie.vote_average
+            },
+            sources: uniqueSources.slice(0, 15) // Limit to 15 sources
+        };
+
+        // Cache the response
+        streamCache.set(id, {
+            timestamp: Date.now(),
+            data: responseData
+        });
+
+        res.json(responseData);
+
+    } catch (err) {
+        console.error('[GET /api/stream/sources/:id]', err.message);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// =============================================================================
+
+/**
+ * GET /api/stream/proxy
+ *
+ * Proxies video streams to avoid CORS issues when using direct video URLs
+ */
+app.get('/api/stream/proxy', async (req, res) => {
+    const { url } = req.query;
+    
+    if (!url) {
+        return res.status(400).json({ error: 'URL parameter required' });
+    }
+
+    try {
+        // Handle YouTube URLs specially
+        if (url.includes('youtube.com') || url.includes('youtu.be')) {
+            const videoId = extractVideoId(url);
+            if (videoId) {
+                // For YouTube, redirect to the embed URL
+                return res.redirect(`https://www.youtube.com/embed/${videoId}?autoplay=1&rel=0`);
+            }
+        }
+
+        // For other videos, proxy the stream
+        const response = await axios({
+            method: 'get',
+            url: url,
+            responseType: 'stream',
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                'Referer': 'https://playkit.com/'
+            }
+        });
+
+        // Set appropriate headers
+        res.setHeader('Content-Type', response.headers['content-type'] || 'video/mp4');
+        res.setHeader('Access-Control-Allow-Origin', '*');
+        
+        // Handle range requests for video seeking
+        if (req.headers.range) {
+            res.setHeader('Accept-Ranges', 'bytes');
+            res.setHeader('Content-Range', response.headers['content-range']);
+            res.status(206);
+        }
+
+        // Pipe the video stream
+        response.data.pipe(res);
+
+        response.data.on('error', (err) => {
+            console.error('[Proxy] Stream error:', err);
+            if (!res.headersSent) {
+                res.status(500).end();
+            }
+        });
+
+    } catch (err) {
+        console.error('[Proxy] Error:', err.message);
+        if (!res.headersSent) {
+            res.status(500).json({ error: 'Proxy failed' });
+        }
+    }
+});
+
+// =============================================================================
+
+/**
+ * GET /api/stream/info/:id
+ *
+ * Returns detailed information about a specific YouTube video
+ */
+app.get('/api/stream/info/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+        
+        const response = await axios.get(
+            `https://www.googleapis.com/youtube/v3/videos?part=snippet,contentDetails&id=${id}&key=${YOUTUBE_KEY}`
+        );
+
+        if (!response.data.items || response.data.items.length === 0) {
+            return res.status(404).json({ error: 'Video not found' });
+        }
+
+        const video = response.data.items[0];
+        
+        // Parse duration from ISO 8601 format
+        const duration = video.contentDetails.duration;
+        const durationMatch = duration.match(/PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?/);
+        const hours = parseInt(durationMatch[1] || 0);
+        const minutes = parseInt(durationMatch[2] || 0);
+        const seconds = parseInt(durationMatch[3] || 0);
+        const totalMinutes = hours * 60 + minutes + (seconds > 0 ? 1 : 0);
+
+        res.json({
+            id: id,
+            title: video.snippet.title,
+            duration: totalMinutes,
+            durationText: `${hours > 0 ? hours + ':' : ''}${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`,
+            thumbnail: video.snippet.thumbnails.maxresdefault?.url || video.snippet.thumbnails.high.url,
+            channelTitle: video.snippet.channelTitle,
+            publishedAt: video.snippet.publishedAt
+        });
+
+    } catch (err) {
+        console.error('[GET /api/stream/info/:id]', err.message);
         res.status(500).json({ error: err.message });
     }
 });
@@ -490,18 +733,21 @@ app.post('/api/downloads/history', (req, res) => {
 // =============================================================================
 app.listen(PORT, HOST, () => {
     console.log(`
-╔══════════════════════════════════════════════╗
-║          PLAYKIT Download Server             ║
-║  Running on http://${HOST}:${PORT}           ║
-║                                              ║
-║  Routes:                                     ║
-║  GET  /api/health                            ║
-║  GET  /api/movie/:id                         ║
-║  GET  /api/download/options/:id              ║
-║  GET  /api/download                          ║
-║  GET  /api/download/progress/:id  (SSE)      ║
-║  GET  /api/downloads/history                 ║
-║  POST /api/downloads/history                 ║
-╚══════════════════════════════════════════════╝
+╔════════════════════════════════════════════════════════════╗
+║              PLAYKIT Download & Streaming Server           ║
+║  Running on http://${HOST}:${PORT}                                   ║
+║                                                            ║
+║  Routes:                                                   ║
+║  GET  /api/health                                          ║
+║  GET  /api/movie/:id                                       ║
+║  GET  /api/stream/sources/:id     (NEW)                    ║
+║  GET  /api/stream/proxy           (NEW)                    ║
+║  GET  /api/stream/info/:id        (NEW)                    ║
+║  GET  /api/download/options/:id                            ║
+║  GET  /api/download                                        ║
+║  GET  /api/download/progress/:id  (SSE)                    ║
+║  GET  /api/downloads/history                               ║
+║  POST /api/downloads/history                               ║
+╚════════════════════════════════════════════════════════════╝
     `);
 });
