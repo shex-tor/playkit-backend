@@ -1,6 +1,6 @@
 // =============================================================================
 // server.js — PLAYKIT Movie Download Server
-// Deploy to Railway with package.json in the same repo root
+// Deploy to Render with package.json in the same repo root
 // =============================================================================
 
 const express  = require('express');
@@ -20,7 +20,7 @@ const HOST = '0.0.0.0';
 
 // =============================================================================
 // CORS — manual middleware, placed FIRST.
-// Sets headers on EVERY response including Railway wake-up error pages.
+// Sets headers on EVERY response including Render wake-up error pages.
 // =============================================================================
 app.use((req, res, next) => {
     res.setHeader('Access-Control-Allow-Origin',   '*');
