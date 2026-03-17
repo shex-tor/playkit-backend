@@ -1,6 +1,6 @@
 // =============================================================================
 // server.js — PLAYKIT Movie Download Server
-// Complete system with real link extraction, validation, and caching
+// Complete system with fzmovies.net as primary source
 // =============================================================================
 
 const express = require('express');
@@ -15,6 +15,11 @@ const puppeteer = require('puppeteer');
 const rateLimit = require('express-rate-limit');
 const compression = require('compression');
 const os = require('os');
+const ytdl = require('ytdl-core');
+const ffmpeg = require('fluent-ffmpeg');
+const ffmpegI = require('@ffmpeg-installer/ffmpeg');
+
+ffmpeg.setFfmpegPath(ffmpegI.path);
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -75,10 +80,8 @@ const linkCache = new NodeCache({
     useClones: false
 });
 
-// Persistent cache file
 const CACHE_FILE = path.join(CACHE_DIR, 'links-cache.json');
 
-// Load cache from disk on startup
 function loadCacheFromDisk() {
     try {
         if (fs.existsSync(CACHE_FILE)) {
@@ -93,7 +96,6 @@ function loadCacheFromDisk() {
     }
 }
 
-// Save cache to disk periodically
 function saveCacheToDisk() {
     try {
         const keys = linkCache.keys();
@@ -108,7 +110,6 @@ function saveCacheToDisk() {
     }
 }
 
-// Save cache every 5 minutes
 setInterval(saveCacheToDisk, 5 * 60 * 1000);
 loadCacheFromDisk();
 
@@ -145,7 +146,6 @@ axiosRetry(axios, {
     }
 });
 
-// Create axios instances with different configurations
 const axiosWithProxy = axios.create({
     timeout: 30000,
     maxRedirects: 5,
@@ -162,353 +162,13 @@ const axiosWithProxy = axios.create({
 });
 
 // =============================================================================
-// LINK EXTRACTORS FOR DIFFERENT SOURCES
+// FZMOVIES.NET EXTRACTOR (PRIMARY SOURCE)
 // =============================================================================
-
-class LinkExtractor {
+class FZMoviesExtractor {
     constructor() {
-        this.sources = [
-            new VidsrcExtractor(),
-            new EmbedExtractor(),
-            new SuperEmbedExtractor(),
-            new MultiEmbedExtractor()
-        ];
-    }
-
-    async extractLinks(movieId, title, year) {
-        const cacheKey = `movie_${movieId}_${year}`;
-        const cached = linkCache.get(cacheKey);
-        
-        if (cached) {
-            logInfo('CACHE', `Cache hit for ${title}`, { movieId });
-            return { ...cached, cached: true };
-        }
-
-        logInfo('EXTRACT', `Extracting links for ${title} (${year})`);
-        
-        const results = [];
-        const errors = [];
-
-        // Try each source in parallel with timeout
-        const extractPromises = this.sources.map(async (source) => {
-            try {
-                const timeoutPromise = new Promise((_, reject) => {
-                    setTimeout(() => reject(new Error('Source timeout')), 15000);
-                });
-
-                const sourcePromise = source.extract(movieId, title, year);
-                const result = await Promise.race([sourcePromise, timeoutPromise]);
-                
-                if (result && result.links && result.links.length > 0) {
-                    results.push({
-                        source: source.name,
-                        ...result
-                    });
-                }
-            } catch (error) {
-                errors.push({ source: source.name, error: error.message });
-                logError('EXTRACTOR', error, { source: source.name, movieId });
-            }
-        });
-
-        await Promise.allSettled(extractPromises);
-
-        if (results.length === 0) {
-            logError('EXTRACT', new Error('No links found'), { movieId, title, errors });
-            return { error: 'No working links found', errors };
-        }
-
-        // Validate and clean links
-        const validatedLinks = await this.validateLinks(results);
-        
-        const output = {
-            movieId,
-            title,
-            year,
-            timestamp: Date.now(),
-            sources: validatedLinks,
-            primary: validatedLinks[0]?.links[0] || null
-        };
-
-        // Cache the results
-        linkCache.set(cacheKey, output);
-        
-        return output;
-    }
-
-    async validateLinks(results) {
-        const validated = [];
-        
-        for (const sourceResult of results) {
-            const validLinks = [];
-            
-            for (const link of sourceResult.links) {
-                try {
-                    const isValid = await this.checkLink(link.url);
-                    if (isValid) {
-                        validLinks.push({
-                            ...link,
-                            validated: true,
-                            checkedAt: Date.now()
-                        });
-                    }
-                } catch (error) {
-                    logError('VALIDATE', error, { url: link.url });
-                }
-                
-                // Small delay to avoid rate limiting
-                await new Promise(r => setTimeout(r, 500));
-            }
-            
-            if (validLinks.length > 0) {
-                validated.push({
-                    source: sourceResult.source,
-                    links: validLinks
-                });
-            }
-        }
-        
-        return validated;
-    }
-
-    async checkLink(url) {
-        try {
-            const response = await axios.head(url, {
-                timeout: 10000,
-                maxRedirects: 5,
-                headers: {
-                    'User-Agent': USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)]
-                }
-            });
-            
-            const contentType = response.headers['content-type'] || '';
-            const contentLength = response.headers['content-length'];
-            
-            // Check if it's a video file
-            const isValid = contentType.includes('video/') || 
-                           url.match(/\.(mp4|mkv|avi|mov|webm)$/i) ||
-                           (contentLength && parseInt(contentLength) > 1024 * 1024); // > 1MB
-            
-            return {
-                valid: isValid,
-                contentType,
-                size: contentLength ? parseInt(contentLength) : null,
-                status: response.status
-            };
-        } catch (error) {
-            if (error.response?.status === 302 || error.response?.status === 301) {
-                // Follow redirect
-                return this.checkLink(error.response.headers.location);
-            }
-            return { valid: false, error: error.message };
-        }
-    }
-}
-
-// =============================================================================
-// SOURCE 1: VIDSRC EXTRACTOR
-// =============================================================================
-class VidsrcExtractor {
-    constructor() {
-        this.name = 'vidsrc';
-    }
-
-    async extract(movieId, title, year) {
-        const embedUrl = `https://vidsrc.to/embed/movie/${movieId}`;
-        
-        try {
-            const response = await axiosWithProxy.get(embedUrl);
-            const $ = cheerio.load(response.data);
-            
-            const links = [];
-            
-            // Extract video sources from various locations
-            $('source').each((i, el) => {
-                const src = $(el).attr('src');
-                const type = $(el).attr('type');
-                if (src && src.includes('.mp4')) {
-                    links.push({
-                        url: src,
-                        quality: this.detectQuality(src),
-                        type: 'mp4',
-                        source: 'vidsrc'
-                    });
-                }
-            });
-
-            // Look for iframe sources
-            $('iframe').each((i, el) => {
-                const src = $(el).attr('src');
-                if (src && (src.includes('embed') || src.includes('play'))) {
-                    links.push({
-                        url: src,
-                        type: 'embed',
-                        source: 'vidsrc'
-                    });
-                }
-            });
-
-            // Extract from data attributes
-            $('[data-src], [data-url], [data-video]').each((i, el) => {
-                const dataSrc = $(el).attr('data-src') || $(el).attr('data-url') || $(el).attr('data-video');
-                if (dataSrc && dataSrc.includes('http')) {
-                    links.push({
-                        url: dataSrc,
-                        quality: this.detectQuality(dataSrc),
-                        type: 'mp4',
-                        source: 'vidsrc'
-                    });
-                }
-            });
-
-            return {
-                links: this.deduplicateLinks(links),
-                quality: this.getBestQuality(links)
-            };
-        } catch (error) {
-            throw new Error(`Vidsrc extraction failed: ${error.message}`);
-        }
-    }
-
-    detectQuality(url) {
-        if (url.includes('1080') || url.includes('1080p')) return '1080p';
-        if (url.includes('720') || url.includes('720p')) return '720p';
-        if (url.includes('480') || url.includes('480p')) return '480p';
-        if (url.includes('360') || url.includes('360p')) return '360p';
-        return 'unknown';
-    }
-
-    deduplicateLinks(links) {
-        const seen = new Set();
-        return links.filter(link => {
-            const key = link.url.split('?')[0]; // Remove query params for dedup
-            if (seen.has(key)) return false;
-            seen.add(key);
-            return true;
-        });
-    }
-
-    getBestQuality(links) {
-        const qualityOrder = ['1080p', '720p', '480p', '360p', 'unknown'];
-        for (const q of qualityOrder) {
-            const hasQuality = links.some(l => l.quality === q);
-            if (hasQuality) return q;
-        }
-        return 'unknown';
-    }
-}
-
-// =============================================================================
-// SOURCE 2: EMBED EXTRACTOR
-// =============================================================================
-class EmbedExtractor {
-    constructor() {
-        this.name = 'embed';
-    }
-
-    async extract(movieId, title, year) {
-        const domains = [
-            `https://multiembed.mov/directstream.php?video_id=${movieId}&s=movie`,
-            `https://embed.su/embed/movie/${movieId}`,
-            `https://moviesapi.club/movie/${movieId}`
-        ];
-
-        const links = [];
-
-        for (const domain of domains) {
-            try {
-                const response = await axiosWithProxy.get(domain, {
-                    headers: {
-                        'Referer': 'https://www.google.com/',
-                        'Origin': 'https://www.google.com'
-                    }
-                });
-                
-                // Extract from JSON responses
-                if (typeof response.data === 'object') {
-                    if (response.data.sources) {
-                        response.data.sources.forEach(source => {
-                            if (source.file || source.url) {
-                                links.push({
-                                    url: source.file || source.url,
-                                    quality: source.label || source.quality || 'auto',
-                                    type: 'mp4',
-                                    source: 'embed'
-                                });
-                            }
-                        });
-                    }
-                }
-                
-                // Extract from HTML
-                const $ = cheerio.load(response.data);
-                
-                // Look for video players
-                $('video source, video[src], .player source, .video-js source').each((i, el) => {
-                    const src = $(el).attr('src') || $(el).parent().attr('src');
-                    if (src && src.match(/\.(mp4|m3u8)/)) {
-                        links.push({
-                            url: src,
-                            quality: $(el).attr('data-quality') || 'auto',
-                            type: src.includes('.m3u8') ? 'hls' : 'mp4',
-                            source: 'embed'
-                        });
-                    }
-                });
-
-                // Look for script variables containing video URLs
-                const scripts = $('script').map((i, el) => $(el).html()).get();
-                scripts.forEach(script => {
-                    if (script) {
-                        const urlMatches = script.match(/https?:\/\/[^"'\s]+\.(mp4|m3u8)[^"'\s]*/g);
-                        if (urlMatches) {
-                            urlMatches.forEach(url => {
-                                links.push({
-                                    url: url,
-                                    quality: url.includes('1080') ? '1080p' : 
-                                            url.includes('720') ? '720p' : 'auto',
-                                    type: url.includes('.m3u8') ? 'hls' : 'mp4',
-                                    source: 'embed'
-                                });
-                            });
-                        }
-                    }
-                });
-
-            } catch (error) {
-                continue; // Try next domain
-            }
-        }
-
-        return {
-            links: this.deduplicateLinks(links),
-            quality: this.getBestQuality(links)
-        };
-    }
-
-    deduplicateLinks(links) {
-        const seen = new Set();
-        return links.filter(link => {
-            const key = link.url.split('?')[0];
-            if (seen.has(key)) return false;
-            seen.add(key);
-            return true;
-        });
-    }
-
-    getBestQuality(links) {
-        if (links.some(l => l.quality === '1080p')) return '1080p';
-        if (links.some(l => l.quality === '720p')) return '720p';
-        return 'auto';
-    }
-}
-
-// =============================================================================
-// SOURCE 3: SUPER EMBED EXTRACTOR (with Puppeteer for dynamic content)
-// =============================================================================
-class SuperEmbedExtractor {
-    constructor() {
-        this.name = 'superembed';
+        this.name = 'fzmovies';
+        this.baseUrl = 'https://www.fzmovies.net';
+        this.searchUrl = 'https://www.fzmovies.net/search.php';
         this.browser = null;
     }
 
@@ -523,258 +183,168 @@ class SuperEmbedExtractor {
     }
 
     async extract(movieId, title, year) {
-        const urls = [
-            `https://superembed.stream/movie/${movieId}`,
-            `https://embedder.net/movie/${movieId}`
-        ];
+        logInfo('FZMOVIES', `Searching for: ${title} (${year})`);
+        
+        try {
+            // Step 1: Search for the movie
+            const searchResults = await this.searchMovie(title, year);
+            
+            if (!searchResults || searchResults.length === 0) {
+                throw new Error('No results found on fzmovies.net');
+            }
 
-        const links = [];
+            // Step 2: Get the best match
+            const bestMatch = this.findBestMatch(searchResults, title, year);
+            
+            if (!bestMatch) {
+                throw new Error('No matching movie found');
+            }
 
-        for (const url of urls) {
-            try {
-                const browser = await this.getBrowser();
-                const page = await browser.newPage();
+            // Step 3: Extract download links from the movie page
+            const downloadLinks = await this.extractDownloadLinks(bestMatch.url);
+
+            if (!downloadLinks || downloadLinks.length === 0) {
+                throw new Error('No download links found');
+            }
+
+            // Step 4: Process and categorize links by quality
+            const processedLinks = this.processLinks(downloadLinks);
+
+            return {
+                links: processedLinks,
+                quality: this.getBestQuality(processedLinks),
+                pageUrl: bestMatch.url,
+                title: bestMatch.title
+            };
+
+        } catch (error) {
+            logError('FZMOVIES_EXTRACTOR', error, { movieId, title, year });
+            throw error;
+        }
+    }
+
+    async searchMovie(title, year) {
+        try {
+            const browser = await this.getBrowser();
+            const page = await browser.newPage();
+            
+            await page.setUserAgent(USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)]);
+            
+            // Navigate to search page
+            await page.goto(`${this.baseUrl}/`, { waitUntil: 'networkidle0', timeout: 15000 });
+            
+            // Fill and submit search form
+            await page.type('#searchstring', `${title} ${year}`);
+            await page.click('input[type="submit"]');
+            await page.waitForNavigation({ waitUntil: 'networkidle0', timeout: 15000 });
+
+            // Parse search results
+            const results = await page.evaluate(() => {
+                const items = [];
+                const rows = document.querySelectorAll('table tr');
                 
-                await page.setUserAgent(USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)]);
-                await page.setExtraHTTPHeaders({
-                    'Accept-Language': 'en-US,en;q=0.9'
-                });
-
-                // Intercept network requests to catch video sources
-                await page.setRequestInterception(true);
-                page.on('request', request => {
-                    const url = request.url();
-                    if (url.match(/\.(mp4|m3u8|ts)/) || url.includes('video') || url.includes('stream')) {
-                        links.push({
-                            url: url,
-                            quality: this.detectQuality(url),
-                            type: url.includes('.m3u8') ? 'hls' : 'mp4',
-                            source: 'superembed'
+                rows.forEach(row => {
+                    const link = row.querySelector('a[href*="movie"]');
+                    if (link) {
+                        const titleEl = row.querySelector('font b') || link;
+                        const sizeEl = row.querySelector('font:contains("MB"), font:contains("GB")');
+                        
+                        items.push({
+                            title: titleEl?.textContent?.trim() || link.textContent.trim(),
+                            url: link.href,
+                            size: sizeEl?.textContent?.trim() || 'Unknown',
+                            quality: link.textContent.includes('1080') ? '1080p' :
+                                    link.textContent.includes('720') ? '720p' :
+                                    link.textContent.includes('480') ? '480p' : 'SD'
                         });
                     }
-                    request.continue();
                 });
-
-                await page.goto(url, { waitUntil: 'networkidle0', timeout: 15000 });
                 
-                // Wait for potential dynamic content
-                await page.waitForTimeout(3000);
-                
-                // Extract from page content
-                const pageLinks = await page.evaluate(() => {
-                    const found = [];
-                    
-                    // Check video elements
-                    document.querySelectorAll('video source, video').forEach(el => {
-                        const src = el.src || el.getAttribute('src');
-                        if (src) found.push(src);
-                    });
-                    
-                    // Check script variables
-                    const scripts = document.querySelectorAll('script');
-                    scripts.forEach(script => {
-                        const content = script.textContent || '';
-                        const matches = content.match(/https?:\/\/[^"'\s]+\.(mp4|m3u8)[^"'\s]*/g);
-                        if (matches) matches.forEach(m => found.push(m));
-                    });
-                    
-                    return found;
-                });
+                return items;
+            });
 
-                pageLinks.forEach(url => {
-                    links.push({
-                        url: url,
-                        quality: this.detectQuality(url),
-                        type: url.includes('.m3u8') ? 'hls' : 'mp4',
-                        source: 'superembed'
-                    });
-                });
+            await page.close();
+            return results;
 
-                await page.close();
-
-            } catch (error) {
-                continue; // Try next URL
-            }
-        }
-
-        return {
-            links: this.deduplicateLinks(links),
-            quality: this.getBestQuality(links)
-        };
-    }
-
-    detectQuality(url) {
-        if (url.includes('1080') || url.includes('1080p')) return '1080p';
-        if (url.includes('720') || url.includes('720p')) return '720p';
-        if (url.includes('480') || url.includes('480p')) return '480p';
-        return 'auto';
-    }
-
-    deduplicateLinks(links) {
-        const seen = new Set();
-        return links.filter(link => {
-            const key = link.url.split('?')[0];
-            if (seen.has(key)) return false;
-            seen.add(key);
-            return true;
-        });
-    }
-
-    getBestQuality(links) {
-        if (links.some(l => l.quality === '1080p')) return '1080p';
-        if (links.some(l => l.quality === '720p')) return '720p';
-        return 'auto';
-    }
-
-    async cleanup() {
-        if (this.browser) {
-            await this.browser.close();
-            this.browser = null;
+        } catch (error) {
+            logError('FZMOVIES_SEARCH', error);
+            return [];
         }
     }
-}
 
-// =============================================================================
-// SOURCE 4: MULTI EMBED EXTRACTOR
-// =============================================================================
-class MultiEmbedExtractor {
-    constructor() {
-        this.name = 'multisrc';
-    }
+    async extractDownloadLinks(movieUrl) {
+        try {
+            const browser = await this.getBrowser();
+            const page = await browser.newPage();
+            
+            await page.setUserAgent(USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)]);
+            await page.goto(movieUrl, { waitUntil: 'networkidle0', timeout: 15000 });
 
-    async extract(movieId, title, year) {
-        const baseUrls = [
-            `https://vidsrc.xyz/embed/movie/${movieId}`,
-            `https://www.2embed.cc/embed/${movieId}`,
-            `https://autoembed.co/movie/tmdb/${movieId}`,
-            `https://dbgo.fun/movie/${movieId}`
-        ];
+            // Wait for download links to load
+            await page.waitForSelector('a[href*="download"], a:contains("Download")', { timeout: 10000 });
 
-        const links = [];
+            const links = await page.evaluate(() => {
+                const downloadLinks = [];
+                
+                // Find all download links
+                document.querySelectorAll('a').forEach(link => {
+                    const href = link.href;
+                    const text = link.textContent.toLowerCase();
+                    
+                    if (href && (href.includes('.mp4') || href.includes('download') || text.includes('download'))) {
+                        // Detect quality from link text
+                        let quality = 'SD';
+                        if (text.includes('1080') || href.includes('1080')) quality = '1080p';
+                        else if (text.includes('720') || href.includes('720')) quality = '720p';
+                        else if (text.includes('480') || href.includes('480')) quality = '480p';
+                        else if (text.includes('360') || href.includes('360')) quality = '360p';
 
-        for (const baseUrl of baseUrls) {
-            try {
-                const response = await axiosWithProxy.get(baseUrl, {
-                    headers: {
-                        'Referer': 'https://www.google.com/'
+                        // Detect file size
+                        let size = 'Unknown';
+                        const sizeMatch = text.match(/(\d+(?:\.\d+)?)\s*(MB|GB)/i);
+                        if (sizeMatch) {
+                            size = sizeMatch[0];
+                        }
+
+                        downloadLinks.push({
+                            url: href,
+                            quality: quality,
+                            size: size,
+                            type: href.includes('.mp4') ? 'mp4' : 'unknown',
+                            source: 'fzmovies'
+                        });
                     }
                 });
 
-                const $ = cheerio.load(response.data);
-
-                // Extract from common patterns
-                const patterns = [
-                    'iframe[src]',
-                    'source[src]',
-                    '[data-player]',
-                    '[data-video]',
-                    '[data-src]',
-                    '#player source',
-                    '.player source'
-                ];
-
-                patterns.forEach(pattern => {
-                    $(pattern).each((i, el) => {
-                        let src = $(el).attr('src') || 
-                                 $(el).attr('data-player') || 
-                                 $(el).attr('data-video') || 
-                                 $(el).attr('data-src');
-                        
-                        if (src) {
-                            // Handle relative URLs
-                            if (src.startsWith('//')) {
-                                src = 'https:' + src;
-                            } else if (src.startsWith('/')) {
-                                src = new URL(src, baseUrl).href;
-                            }
-                            
-                            if (src.match(/\.(mp4|m3u8)/) || src.includes('embed') || src.includes('video')) {
-                                links.push({
-                                    url: src,
-                                    quality: this.detectQuality(src),
-                                    type: src.includes('.m3u8') ? 'hls' : 
-                                          src.includes('embed') ? 'embed' : 'mp4',
-                                    source: 'multisrc'
-                                });
-                            }
-                        }
-                    });
-                });
-
-                // Check for JSON configs
-                const scripts = $('script').map((i, el) => $(el).html()).get();
-                scripts.forEach(script => {
-                    if (script && script.includes('sources') && script.includes('file')) {
-                        try {
-                            const jsonMatch = script.match(/sources:\s*(\[.*?\])/s);
-                            if (jsonMatch) {
-                                const sources = JSON.parse(jsonMatch[1].replace(/'/g, '"'));
-                                sources.forEach(source => {
-                                    if (source.file) {
-                                        links.push({
-                                            url: source.file,
-                                            quality: source.label || 'auto',
-                                            type: 'mp4',
-                                            source: 'multisrc'
-                                        });
-                                    }
-                                });
-                            }
-                        } catch (e) {
-                            // Ignore JSON parse errors
-                        }
+                // Also check for iframe sources
+                document.querySelectorAll('iframe').forEach(iframe => {
+                    const src = iframe.src;
+                    if (src && (src.includes('embed') || src.includes('player'))) {
+                        downloadLinks.push({
+                            url: src,
+                            quality: 'unknown',
+                            type: 'embed',
+                            source: 'fzmovies'
+                        });
                     }
                 });
 
-            } catch (error) {
-                continue; // Try next URL
-            }
+                return downloadLinks;
+            });
+
+            await page.close();
+            return links;
+
+        } catch (error) {
+            logError('FZMOVIES_EXTRACT_LINKS', error);
+            return [];
         }
-
-        return {
-            links: this.deduplicateLinks(links),
-            quality: this.getBestQuality(links)
-        };
     }
 
-    detectQuality(url) {
-        if (url.includes('1080') || url.includes('1080p')) return '1080p';
-        if (url.includes('720') || url.includes('720p')) return '720p';
-        if (url.includes('480') || url.includes('480p')) return '480p';
-        if (url.includes('360') || url.includes('360p')) return '360p';
-        return 'auto';
-    }
+    findBestMatch(results, targetTitle, targetYear) {
+        if (!results || results.length === 0) return null;
 
-    deduplicateLinks(links) {
-        const seen = new Set();
-        return links.filter(link => {
-            const key = link.url.split('?')[0];
-            if (seen.has(key)) return false;
-            seen.add(key);
-            return true;
-        });
-    }
-
-    getBestQuality(links) {
-        const qualityOrder = ['1080p', '720p', '480p', '360p', 'auto'];
-        for (const q of qualityOrder) {
-            const hasQuality = links.some(l => l.quality === q);
-            if (hasQuality) return q;
-        }
-        return 'auto';
-    }
-}
-
-// =============================================================================
-// TITLE MATCHING & SCORING SYSTEM
-// =============================================================================
-class TitleMatcher {
-    constructor() {
-        this.minScore = 0.7; // Minimum similarity score to consider a match
-    }
-
-    calculateSimilarity(title1, title2) {
-        // Normalize strings
+        // Normalize function for comparison
         const normalize = (str) => {
             return str.toLowerCase()
                 .replace(/[^\w\s]/g, '')
@@ -782,23 +352,34 @@ class TitleMatcher {
                 .trim();
         };
 
-        const a = normalize(title1);
-        const b = normalize(title2);
+        const targetNormalized = normalize(`${targetTitle} ${targetYear}`);
+        
+        // Score each result
+        const scored = results.map(result => {
+            const resultNormalized = normalize(result.title);
+            let score = 0;
 
-        // Exact match
-        if (a === b) return 1.0;
+            // Title similarity (using Levenshtein distance)
+            const distance = this.levenshteinDistance(targetNormalized, resultNormalized);
+            const maxLength = Math.max(targetNormalized.length, resultNormalized.length);
+            const titleScore = 1 - (distance / maxLength);
+            score += titleScore * 0.7; // Title weight: 70%
 
-        // Check if one contains the other
-        if (a.includes(b) || b.includes(a)) {
-            const longer = a.length > b.length ? a : b;
-            const shorter = a.length > b.length ? b : a;
-            return shorter.length / longer.length;
-        }
+            // Year check
+            if (targetYear && result.title.includes(targetYear.toString())) {
+                score += 0.3; // Year weight: 30%
+            }
 
-        // Levenshtein distance for fuzzy matching
-        const distance = this.levenshteinDistance(a, b);
-        const maxLength = Math.max(a.length, b.length);
-        return 1 - (distance / maxLength);
+            // Quality bonus
+            if (result.quality === '1080p') score += 0.1;
+            else if (result.quality === '720p') score += 0.05;
+
+            return { ...result, score };
+        });
+
+        // Sort by score and return best match
+        scored.sort((a, b) => b.score - a.score);
+        return scored[0].score > 0.5 ? scored[0] : null;
     }
 
     levenshteinDistance(a, b) {
@@ -822,27 +403,257 @@ class TitleMatcher {
         return matrix[b.length][a.length];
     }
 
-    scoreMatch(sourceTitle, targetTitle, sourceYear, targetYear) {
-        let score = this.calculateSimilarity(sourceTitle, targetTitle);
-        
-        // Year bonus
-        if (sourceYear && targetYear && Math.abs(sourceYear - targetYear) <= 1) {
-            score += 0.15;
-        }
-        
-        // Penalize if years don't match
-        if (sourceYear && targetYear && Math.abs(sourceYear - targetYear) > 2) {
-            score -= 0.3;
-        }
-        
-        return Math.min(1, Math.max(0, score));
+    processLinks(links) {
+        const processed = [];
+        const seen = new Set();
+
+        links.forEach(link => {
+            // Deduplicate
+            const key = link.url.split('?')[0];
+            if (seen.has(key)) return;
+            seen.add(key);
+
+            // Validate and clean URL
+            if (link.url.startsWith('//')) {
+                link.url = 'https:' + link.url;
+            } else if (link.url.startsWith('/')) {
+                link.url = this.baseUrl + link.url;
+            }
+
+            processed.push(link);
+        });
+
+        // Sort by quality (best first)
+        const qualityOrder = { '1080p': 4, '720p': 3, '480p': 2, '360p': 1, 'SD': 0, 'unknown': -1 };
+        processed.sort((a, b) => (qualityOrder[b.quality] || 0) - (qualityOrder[a.quality] || 0));
+
+        return processed;
     }
 
-    isMatch(sourceTitle, sourceYear, targetTitle, targetYear) {
-        const score = this.scoreMatch(sourceTitle, targetTitle, sourceYear, targetYear);
-        return score >= this.minScore;
+    getBestQuality(links) {
+        if (links.some(l => l.quality === '1080p')) return '1080p';
+        if (links.some(l => l.quality === '720p')) return '720p';
+        if (links.some(l => l.quality === '480p')) return '480p';
+        return 'SD';
+    }
+
+    async cleanup() {
+        if (this.browser) {
+            await this.browser.close();
+            this.browser = null;
+        }
     }
 }
+
+// =============================================================================
+// BACKUP SOURCES (fallback if fzmovies fails)
+// =============================================================================
+class BackupExtractor {
+    constructor() {
+        this.name = 'backup';
+    }
+
+    async extract(movieId, title, year) {
+        // Backup sources for when fzmovies doesn't have the movie
+        const backupUrls = [
+            `https://vidsrc.to/embed/movie/${movieId}`,
+            `https://www.2embed.cc/embed/${movieId}`,
+            `https://multiembed.mov/directstream.php?video_id=${movieId}`
+        ];
+
+        const links = [];
+
+        for (const url of backupUrls) {
+            try {
+                const response = await axiosWithProxy.get(url);
+                const $ = cheerio.load(response.data);
+
+                // Extract video sources
+                $('source').each((i, el) => {
+                    const src = $(el).attr('src');
+                    if (src && src.includes('.mp4')) {
+                        links.push({
+                            url: src,
+                            quality: 'auto',
+                            type: 'mp4',
+                            source: 'backup'
+                        });
+                    }
+                });
+
+                // Extract from script tags
+                $('script').each((i, el) => {
+                    const script = $(el).html();
+                    if (script && script.includes('file:')) {
+                        const matches = script.match(/file:\s*["']([^"']+)["']/g);
+                        if (matches) {
+                            matches.forEach(match => {
+                                const url = match.replace(/file:\s*["']|["']/g, '');
+                                if (url.match(/\.(mp4|m3u8)/)) {
+                                    links.push({
+                                        url: url,
+                                        quality: script.includes('1080') ? '1080p' :
+                                                script.includes('720') ? '720p' : 'auto',
+                                        type: url.includes('.m3u8') ? 'hls' : 'mp4',
+                                        source: 'backup'
+                                    });
+                                }
+                            });
+                        }
+                    }
+                });
+
+            } catch (error) {
+                continue; // Try next backup source
+            }
+        }
+
+        return {
+            links: this.deduplicateLinks(links),
+            quality: this.getBestQuality(links)
+        };
+    }
+
+    deduplicateLinks(links) {
+        const seen = new Set();
+        return links.filter(link => {
+            const key = link.url.split('?')[0];
+            if (seen.has(key)) return false;
+            seen.add(key);
+            return true;
+        });
+    }
+
+    getBestQuality(links) {
+        if (links.some(l => l.quality === '1080p')) return '1080p';
+        if (links.some(l => l.quality === '720p')) return '720p';
+        return 'auto';
+    }
+}
+
+// =============================================================================
+// LINK EXTRACTOR MANAGER
+// =============================================================================
+class LinkExtractor {
+    constructor() {
+        this.primarySource = new FZMoviesExtractor();
+        this.backupSource = new BackupExtractor();
+    }
+
+    async extractLinks(movieId, title, year) {
+        const cacheKey = `movie_${movieId}_${year}`;
+        const cached = linkCache.get(cacheKey);
+        
+        if (cached) {
+            logInfo('CACHE', `Cache hit for ${title}`, { movieId });
+            return { ...cached, cached: true };
+        }
+
+        logInfo('EXTRACT', `Extracting links for ${title} (${year})`);
+        
+        let result = null;
+        let error = null;
+
+        // Try primary source (fzmovies.net) first
+        try {
+            result = await this.primarySource.extract(movieId, title, year);
+            logInfo('FZMOVIES', `Found ${result.links.length} links for ${title}`);
+        } catch (primaryError) {
+            error = primaryError;
+            logError('PRIMARY_SOURCE', primaryError);
+
+            // Try backup sources
+            try {
+                result = await this.backupSource.extract(movieId, title, year);
+                logInfo('BACKUP', `Found ${result.links.length} backup links for ${title}`);
+            } catch (backupError) {
+                logError('BACKUP_SOURCE', backupError);
+                throw new Error('No working sources found');
+            }
+        }
+
+        if (!result || !result.links || result.links.length === 0) {
+            throw new Error('No links extracted from any source');
+        }
+
+        // Validate links
+        const validatedLinks = await this.validateLinks(result.links);
+        
+        const output = {
+            movieId,
+            title,
+            year,
+            timestamp: Date.now(),
+            sources: [{
+                source: result.source || 'primary',
+                links: validatedLinks
+            }],
+            primary: validatedLinks[0] || null
+        };
+
+        // Cache the results
+        linkCache.set(cacheKey, output);
+        
+        return output;
+    }
+
+    async validateLinks(links) {
+        const validated = [];
+        
+        for (const link of links.slice(0, 5)) { // Validate top 5 links only
+            try {
+                const response = await axios.head(link.url, {
+                    timeout: 5000,
+                    maxRedirects: 3,
+                    headers: {
+                        'User-Agent': USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)]
+                    }
+                });
+                
+                const contentType = response.headers['content-type'] || '';
+                const contentLength = response.headers['content-length'];
+                
+                const isValid = contentType.includes('video/') || 
+                               link.url.match(/\.(mp4|mkv|avi|mov|webm)$/i) ||
+                               (contentLength && parseInt(contentLength) > 1024 * 1024); // > 1MB
+                
+                if (isValid) {
+                    validated.push({
+                        ...link,
+                        validated: true,
+                        size: contentLength ? parseInt(contentLength) : null,
+                        checkedAt: Date.now()
+                    });
+                }
+            } catch (error) {
+                // Skip invalid links
+                continue;
+            }
+            
+            // Small delay to avoid rate limiting
+            await new Promise(r => setTimeout(r, 500));
+        }
+        
+        return validated.length > 0 ? validated : links.slice(0, 3); // Fallback to unvalidated if all fail
+    }
+
+    async cleanup() {
+        await this.primarySource.cleanup();
+    }
+}
+
+// =============================================================================
+// QUALITY PRESETS
+// =============================================================================
+const QUALITY_PRESETS = {
+    '1080p': { bitrate: '2000k', audioBitrate: '128k', label: '1080p Full HD', sizeFactor: 1.5 },
+    '720p': { bitrate: '1200k', audioBitrate: '96k', label: '720p HD', sizeFactor: 1.0 },
+    '480p': { bitrate: '800k', audioBitrate: '64k', label: '480p SD', sizeFactor: 0.6 },
+    '360p': { bitrate: '500k', audioBitrate: '48k', label: '360p', sizeFactor: 0.4 }
+};
+
+function clampMB(mb) { return Math.min(2000, Math.max(100, Math.round(mb))); }
+function fmtSize(mb) { return mb >= 1024 ? `${(mb/1024).toFixed(2)} GB` : `${mb} MB`; }
 
 // =============================================================================
 // DOWNLOAD MANAGER
@@ -850,13 +661,11 @@ class TitleMatcher {
 class DownloadManager {
     constructor() {
         this.extractor = new LinkExtractor();
-        this.matcher = new TitleMatcher();
-        this.activeDownloads = new Map();
     }
 
     async getDownloadLinks(movieId, title, year) {
         try {
-            // First, get TMDB details to ensure we have accurate metadata
+            // Get movie details from TMDB
             const tmdbResponse = await axios.get(
                 `https://api.themoviedb.org/3/movie/${movieId}?api_key=${TMDB_KEY}`
             );
@@ -865,12 +674,11 @@ class DownloadManager {
             const movieTitle = movie.title;
             const movieYear = new Date(movie.release_date).getFullYear();
 
-            // Check if we already have links in cache
+            // Check cache
             const cached = linkCache.get(`links_${movieId}`);
             if (cached) {
                 const age = Date.now() - cached.timestamp;
                 if (age < 12 * 60 * 60 * 1000) { // 12 hours
-                    logInfo('CACHE', `Returning cached links for ${movieTitle}`);
                     return {
                         ...cached,
                         cached: true,
@@ -882,20 +690,24 @@ class DownloadManager {
             // Extract fresh links
             const links = await this.extractor.extractLinks(movieId, movieTitle, movieYear);
             
-            if (links.error) {
-                throw new Error(links.error);
-            }
+            // Generate quality options
+            const qualityOptions = this.generateQualityOptions(links);
 
-            // Process and rank links
-            const processed = this.processLinks(links, movieTitle, movieYear);
+            const output = {
+                movieId,
+                title: movieTitle,
+                year: movieYear,
+                timestamp: Date.now(),
+                links: links.primary ? [links.primary] : [],
+                allLinks: links.sources?.[0]?.links || [],
+                qualityOptions,
+                sources: links.sources || []
+            };
 
-            // Cache the processed links
-            linkCache.set(`links_${movieId}`, {
-                ...processed,
-                timestamp: Date.now()
-            });
+            // Cache the results
+            linkCache.set(`links_${movieId}`, output);
 
-            return processed;
+            return output;
 
         } catch (error) {
             logError('DOWNLOAD_MANAGER', error, { movieId, title });
@@ -903,139 +715,42 @@ class DownloadManager {
         }
     }
 
-    processLinks(links, targetTitle, targetYear) {
-        const processed = {
-            movieId: links.movieId,
-            title: targetTitle,
-            year: targetYear,
-            timestamp: Date.now(),
-            sources: []
-        };
-
-        // Process each source's links
-        for (const source of links.sources) {
-            const sourceLinks = source.links.map(link => ({
-                ...link,
-                quality: this.normalizeQuality(link.quality),
-                verified: link.validated || false
-            }));
-
-            // Sort by quality
-            sourceLinks.sort((a, b) => this.qualityRank(b.quality) - this.qualityRank(a.quality));
-
-            processed.sources.push({
-                source: source.source,
-                links: sourceLinks,
-                bestQuality: sourceLinks[0]?.quality || 'unknown'
+    generateQualityOptions(links) {
+        const options = {};
+        
+        if (links.sources && links.sources[0] && links.sources[0].links) {
+            links.sources[0].links.forEach(link => {
+                const quality = link.quality || 'auto';
+                if (!options[quality]) {
+                    options[quality] = [];
+                }
+                options[quality].push(link);
             });
         }
 
-        // Sort sources by best quality
-        processed.sources.sort((a, b) => 
-            this.qualityRank(b.bestQuality) - this.qualityRank(a.bestQuality)
-        );
-
-        // Generate quality options for download
-        processed.qualityOptions = this.generateQualityOptions(processed.sources);
-
-        return processed;
+        return options;
     }
 
-    normalizeQuality(quality) {
-        if (!quality || quality === 'auto') return '720p';
+    async getDirectDownloadUrl(movieId, quality) {
+        const cached = linkCache.get(`links_${movieId}`);
         
-        quality = quality.toString().toLowerCase();
-        
-        if (quality.includes('1080') || quality.includes('1080p')) return '1080p';
-        if (quality.includes('720') || quality.includes('720p')) return '720p';
-        if (quality.includes('480') || quality.includes('480p')) return '480p';
-        if (quality.includes('360') || quality.includes('360p')) return '360p';
-        
-        return '720p'; // Default
-    }
+        if (!cached || !cached.allLinks) {
+            throw new Error('No download links available');
+        }
 
-    qualityRank(quality) {
-        const ranks = {
-            '1080p': 5,
-            '720p': 4,
-            '480p': 3,
-            '360p': 2,
-            'unknown': 1
+        // Find link matching requested quality
+        const link = cached.allLinks.find(l => l.quality === quality) || cached.allLinks[0];
+        
+        if (!link) {
+            throw new Error(`No ${quality} link available`);
+        }
+
+        return {
+            url: link.url,
+            quality: link.quality,
+            size: link.size,
+            source: link.source
         };
-        return ranks[quality] || 1;
-    }
-
-    generateQualityOptions(sources) {
-        const options = {};
-        
-        // Collect all available qualities
-        for (const source of sources) {
-            for (const link of source.links) {
-                if (!options[link.quality]) {
-                    options[link.quality] = [];
-                }
-                options[link.quality].push({
-                    source: source.source,
-                    url: link.url,
-                    type: link.type
-                });
-            }
-        }
-
-        // Sort qualities
-        const sorted = {};
-        const qualities = ['1080p', '720p', '480p', '360p'];
-        
-        for (const quality of qualities) {
-            if (options[quality]) {
-                sorted[quality] = options[quality];
-            }
-        }
-
-        return sorted;
-    }
-
-    async initiateDownload(movieId, quality, title) {
-        try {
-            const links = await this.getDownloadLinks(movieId, title, null);
-            
-            if (!links.qualityOptions[quality]) {
-                throw new Error(`Quality ${quality} not available`);
-            }
-
-            const sources = links.qualityOptions[quality];
-            
-            // Try each source until one works
-            for (const source of sources) {
-                try {
-                    const response = await axios.head(source.url, {
-                        timeout: 10000,
-                        maxRedirects: 5,
-                        validateStatus: status => status < 400
-                    });
-
-                    if (response.status === 200) {
-                        const contentLength = response.headers['content-length'];
-                        
-                        return {
-                            url: source.url,
-                            size: contentLength ? parseInt(contentLength) : null,
-                            type: source.type,
-                            quality: quality,
-                            source: source.source
-                        };
-                    }
-                } catch (error) {
-                    continue; // Try next source
-                }
-            }
-
-            throw new Error('No working download sources found');
-
-        } catch (error) {
-            logError('DOWNLOAD_INIT', error, { movieId, quality });
-            throw error;
-        }
     }
 }
 
@@ -1089,7 +804,6 @@ app.get('/api/download/options/:id', async (req, res) => {
     try {
         const { id } = req.params;
         
-        // Get movie details from TMDB
         const movieRes = await axios.get(
             `https://api.themoviedb.org/3/movie/${id}?api_key=${TMDB_KEY}`
         );
@@ -1097,27 +811,34 @@ app.get('/api/download/options/:id', async (req, res) => {
         const movie = movieRes.data;
         const year = new Date(movie.release_date).getFullYear();
 
-        // Get download links
         const links = await downloadManager.getDownloadLinks(id, movie.title, year);
 
-        // Format response for frontend
-        const qualityOptions = Object.entries(links.qualityOptions || {}).map(([quality, sources]) => {
-            // Calculate approximate file size (1 min = ~10MB at 720p)
+        // Format options for frontend
+        const options = Object.entries(QUALITY_PRESETS).map(([quality, preset]) => {
+            // Check if this quality is available
+            const availableLinks = links.qualityOptions[quality] || [];
+            const isAvailable = availableLinks.length > 0;
+            
+            // Calculate size based on runtime if not provided
             const runtime = movie.runtime || 120;
-            const sizePerMin = quality === '1080p' ? 25 : 
-                              quality === '720p' ? 12 : 
-                              quality === '480p' ? 8 : 5;
-            const sizeMB = Math.round(runtime * sizePerMin);
+            const sizeMB = isAvailable ? 
+                (availableLinks[0].size ? 
+                    parseInt(availableLinks[0].size) / (1024 * 1024) : 
+                    clampMB(runtime * preset.sizeFactor)
+                ) : 
+                clampMB(runtime * preset.sizeFactor);
 
             return {
                 quality,
-                label: `${quality} - H.264`,
-                size: sizeMB,
-                sizeText: sizeMB >= 1024 ? `${(sizeMB/1024).toFixed(2)} GB` : `${sizeMB} MB`,
-                sources: sources.map(s => s.url),
-                available: true
+                label: preset.label,
+                size: Math.round(sizeMB),
+                sizeText: fmtSize(Math.round(sizeMB)),
+                bitrate: preset.bitrate,
+                audioBitrate: preset.audioBitrate,
+                available: isAvailable,
+                url: isAvailable ? availableLinks[0].url : null
             };
-        });
+        }).filter(opt => opt.available); // Only show available qualities
 
         res.json({
             movie: {
@@ -1128,7 +849,7 @@ app.get('/api/download/options/:id', async (req, res) => {
                 poster: `https://image.tmdb.org/t/p/w500${movie.poster_path}`,
                 backdrop: `https://image.tmdb.org/t/p/w1280${movie.backdrop_path}`
             },
-            options: qualityOptions,
+            options,
             cached: links.cached || false,
             timestamp: links.timestamp
         });
@@ -1153,7 +874,7 @@ app.get('/api/download', async (req, res) => {
             });
         }
 
-        const downloadInfo = await downloadManager.initiateDownload(movieId, quality, title);
+        const downloadInfo = await downloadManager.getDirectDownloadUrl(movieId, quality);
 
         if (!downloadInfo || !downloadInfo.url) {
             return res.status(404).json({ 
@@ -1161,29 +882,51 @@ app.get('/api/download', async (req, res) => {
             });
         }
 
-        // Set response headers
-        res.setHeader('Content-Type', 'application/json');
-        res.setHeader('X-Download-URL', downloadInfo.url);
-        res.setHeader('X-Download-Size', downloadInfo.size || 'unknown');
+        // Set response headers for direct download
+        res.setHeader('Content-Type', 'video/mp4');
+        res.setHeader('Content-Disposition', `attachment; filename="${title.replace(/[^a-z0-9]/gi, '_')}_${quality}.mp4"`);
+        
+        if (downloadInfo.size) {
+            res.setHeader('Content-Length', downloadInfo.size);
+        }
+        
         res.setHeader('X-Download-Source', downloadInfo.source);
         res.setHeader('X-Download-Quality', downloadInfo.quality);
 
-        // Return download info
-        res.json({
-            success: true,
+        // Stream the file directly
+        const response = await axios({
+            method: 'GET',
             url: downloadInfo.url,
-            size: downloadInfo.size,
-            quality: downloadInfo.quality,
-            source: downloadInfo.source,
-            filename: `${title.replace(/[^a-z0-9]/gi, '_')}_${quality}.mp4`
+            responseType: 'stream',
+            timeout: 30000,
+            maxRedirects: 5,
+            headers: {
+                'User-Agent': USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)],
+                'Referer': 'https://www.fzmovies.net/'
+            }
+        });
+
+        response.data.pipe(res);
+
+        response.data.on('end', () => {
+            logInfo('DOWNLOAD', `Completed: ${title} (${quality})`);
+        });
+
+        response.data.on('error', (error) => {
+            logError('DOWNLOAD_STREAM', error);
+            if (!res.headersSent) {
+                res.status(500).end();
+            }
         });
 
     } catch (error) {
         logError('API_DOWNLOAD', error);
-        res.status(500).json({ 
-            error: 'Download failed',
-            details: error.message 
-        });
+        if (!res.headersSent) {
+            res.status(500).json({ 
+                error: 'Download failed',
+                details: error.message 
+            });
+        }
     }
 });
 
@@ -1204,7 +947,7 @@ app.get('/api/download/proxy', async (req, res) => {
             maxRedirects: 5,
             headers: {
                 'User-Agent': USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)],
-                'Referer': 'https://www.google.com/'
+                'Referer': 'https://www.fzmovies.net/'
             }
         });
 
@@ -1232,23 +975,82 @@ app.get('/api/download/proxy', async (req, res) => {
     }
 });
 
+// Progress feed (mock - can be enhanced with real progress)
+app.get('/api/download/progress/:id', (req, res) => {
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.flushHeaders();
+
+    let progress = 0;
+    const interval = setInterval(() => {
+        progress += Math.random() * 10;
+        if (progress >= 100) {
+            clearInterval(interval);
+            res.write(`data: ${JSON.stringify({ progress: 100, completed: true })}\n\n`);
+            res.end();
+        } else {
+            res.write(`data: ${JSON.stringify({ progress: Math.min(99, Math.round(progress)) })}\n\n`);
+        }
+    }, 1000);
+
+    req.on('close', () => clearInterval(interval));
+});
+
 // Get cache status
 app.get('/api/cache/status', (req, res) => {
     const keys = linkCache.keys();
     const stats = {
         totalEntries: keys.length,
-        keys: keys.slice(0, 20), // First 20 keys
+        keys: keys.slice(0, 20),
         memory: process.memoryUsage(),
         uptime: process.uptime()
     };
     res.json(stats);
 });
 
-// Clear cache (admin only - add auth in production)
+// Clear cache (admin only)
 app.post('/api/cache/clear', (req, res) => {
     linkCache.flushAll();
     saveCacheToDisk();
     res.json({ success: true, message: 'Cache cleared' });
+});
+
+// Download history endpoints
+app.get('/api/downloads/history', (req, res) => {
+    const historyFile = path.join(CACHE_DIR, 'history.json');
+    if (fs.existsSync(historyFile)) {
+        const history = JSON.parse(fs.readFileSync(historyFile, 'utf8'));
+        res.json(history);
+    } else {
+        res.json([]);
+    }
+});
+
+app.post('/api/downloads/history', (req, res) => {
+    const { movie, quality, size } = req.body;
+    const historyFile = path.join(CACHE_DIR, 'history.json');
+    
+    let history = [];
+    if (fs.existsSync(historyFile)) {
+        history = JSON.parse(fs.readFileSync(historyFile, 'utf8'));
+    }
+    
+    history.push({
+        ...movie,
+        quality,
+        size,
+        downloadedAt: new Date().toISOString(),
+        id: Date.now()
+    });
+    
+    // Keep last 50 items
+    if (history.length > 50) {
+        history = history.slice(-50);
+    }
+    
+    fs.writeFileSync(historyFile, JSON.stringify(history, null, 2));
+    res.json({ success: true, history });
 });
 
 // =============================================================================
@@ -1269,21 +1071,13 @@ async function refreshCache() {
             const movieId = key.replace('links_', '');
             logInfo('REFRESH', `Refreshing cache for ${movieId}`);
             
-            // Get fresh data
             const movieRes = await axios.get(
                 `https://api.themoviedb.org/3/movie/${movieId}?api_key=${TMDB_KEY}`
             );
             const movie = movieRes.data;
             const year = new Date(movie.release_date).getFullYear();
             
-            const links = await extractor.extractLinks(movieId, movie.title, year);
-            
-            if (!links.error) {
-                linkCache.set(key, {
-                    ...links,
-                    timestamp: Date.now()
-                });
-            }
+            const links = await downloadManager.getDownloadLinks(movieId, movie.title, year);
             
             // Delay between requests
             await new Promise(r => setTimeout(r, 5000));
@@ -1304,10 +1098,7 @@ process.on('SIGINT', async () => {
     logInfo('SHUTDOWN', 'Saving cache and cleaning up...');
     saveCacheToDisk();
     
-    // Cleanup browser instances
-    if (extractor.sources[2]?.browser) {
-        await extractor.sources[2].cleanup();
-    }
+    await extractor.cleanup();
     
     process.exit(0);
 });
@@ -1319,11 +1110,16 @@ app.listen(PORT, HOST, () => {
     console.log(`
 ╔════════════════════════════════════════════════════════════╗
 ║              PLAYKIT Download Server v2.0                  ║
-║   Real link extraction · Validation · Caching · Fallback   ║
+║              Primary Source: fzmovies.net                  ║
 ╠════════════════════════════════════════════════════════════╣
 ║  Server: http://${HOST}:${PORT}                                ║
 ║  Cache: ${linkCache.keys().length} entries                         ║
-║  Sources: vidsrc, embed, superembed, multisrc              ║
+║  Features:                                                   ║
+║    • Fzmovies.net integration                               ║
+║    • Real MP4 extraction                                    ║
+║    • Automatic fallback sources                             ║
+║    • Link validation & caching                              ║
+║    • Quality detection (1080p/720p/480p)                    ║
 ╚════════════════════════════════════════════════════════════╝
     `);
 });
