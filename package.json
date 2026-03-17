@@ -1,7 +1,7 @@
 {
   "name": "playkit-server",
   "version": "2.0.0",
-  "description": "PLAYKIT Advanced Movie Download Server with Real Link Extraction",
+  "description": "PLAYKIT Movie Download Server with fzmovies.net integration",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
